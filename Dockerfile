@@ -1,5 +1,6 @@
 FROM node:22-alpine AS builder
 
+RUN apk upgrade --no-cache zlib
 RUN corepack enable pnpm
 WORKDIR /app
 ENV HUSKY=0
@@ -8,14 +9,16 @@ RUN pnpm install --frozen-lockfile
 COPY tsconfig.json ./
 COPY src/ ./src/
 RUN pnpm run build
+RUN pnpm install --frozen-lockfile --prod --ignore-scripts
 
 FROM node:22-alpine
 
-RUN corepack enable pnpm
+RUN apk upgrade --no-cache zlib
+RUN rm -rf /usr/local/lib/node_modules/npm \
+    && rm -f /usr/local/bin/npm /usr/local/bin/npx
 WORKDIR /app
 ENV HUSKY=0
-COPY package.json pnpm-lock.yaml ./
-RUN pnpm install --frozen-lockfile --prod --ignore-scripts
+COPY --from=builder /app/node_modules/ ./node_modules/
 COPY --from=builder /app/dist/ ./dist/
 
 EXPOSE 3000
