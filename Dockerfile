@@ -1,4 +1,4 @@
-FROM node:22-alpine AS builder
+FROM node:24-alpine AS builder
 
 RUN apk upgrade --no-cache zlib
 RUN corepack enable pnpm
@@ -11,7 +11,7 @@ COPY src/ ./src/
 RUN pnpm run build
 RUN pnpm install --frozen-lockfile --prod --ignore-scripts
 
-FROM node:22-alpine
+FROM node:24-alpine
 
 RUN apk upgrade --no-cache zlib
 RUN rm -rf /usr/local/lib/node_modules/npm \
