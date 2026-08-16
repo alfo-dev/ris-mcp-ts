@@ -8,12 +8,64 @@
  * API Documentation: https://data.bka.gv.at/ris/api/v2.6/
  */
 
+import { fetch as undiciFetch, ProxyAgent } from 'undici';
+
 import type {
   NormalizedSearchResults,
   RawApiResponse,
   RawDocumentReference,
   RawHitsInfo,
 } from './types.js';
+
+// =============================================================================
+// Proxy-aware fetch
+// =============================================================================
+
+/**
+ * Proxy URL resolved once at module load from standard environment variables.
+ * Checks HTTPS_PROXY, https_proxy, HTTP_PROXY, http_proxy in that order.
+ * Undefined when no proxy is configured (direct connection).
+ *
+ * Memoized at module init rather than re-read on every request — env vars do
+ * not change at runtime.  If tests mutate process.env, reset this between runs.
+ */
+const PROXY_URL: string | undefined =
+  process.env['HTTPS_PROXY'] ??
+  process.env['https_proxy'] ??
+  process.env['HTTP_PROXY'] ??
+  process.env['http_proxy'];
+
+/**
+ * Unified fetch wrapper with proxy support.
+ *
+ * Without a proxy: delegates to the global fetch() so that test suites can
+ * stub it with vi.stubGlobal('fetch', mockFetch) and intercept all calls.
+ *
+ * With a proxy (HTTPS_PROXY / HTTP_PROXY / … set): uses undici's own fetch()
+ * together with a ProxyAgent dispatcher.  Both must come from the same undici
+ * build — mixing the npm-installed ProxyAgent with Node's built-in global fetch
+ * (a different undici build) causes "invalid onRequestStart method" /
+ * UND_ERR_INVALID_ARG at dispatch time.
+ */
+const _agentCache = new Map<string, ProxyAgent>();
+function getProxyAgent(url: string): ProxyAgent {
+  let agent = _agentCache.get(url);
+  if (!agent) {
+    agent = new ProxyAgent(url);
+    _agentCache.set(url, agent);
+  }
+  return agent;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function httpFetch(url: string, init: Parameters<typeof undiciFetch>[1]): Promise<any> {
+  if (!PROXY_URL) {
+    // No proxy: use the global fetch so vi.stubGlobal mocks work in tests
+    return globalThis.fetch(url, init as RequestInit);
+  }
+  // Proxy: both dispatcher and fetch must come from the same undici instance
+  return undiciFetch(url, { ...init, dispatcher: getProxyAgent(PROXY_URL) });
+}
 
 // =============================================================================
 // Custom Errors
@@ -211,7 +263,7 @@ async function requestOnce(
   const timeoutId = setTimeout(() => controller.abort(), timeout);
 
   try {
-    const response = await fetch(url, {
+    const response = await httpFetch(url, {
       method: 'GET',
       headers: {
         Accept: 'application/json',
@@ -374,7 +426,7 @@ export async function getDocumentContent(
   const timeoutId = setTimeout(() => controller.abort(), timeout);
 
   try {
-    const response = await fetch(url, {
+    const response = await httpFetch(url, {
       method: 'GET',
       signal: withTimeoutSignal(controller.signal, signal),
     });
