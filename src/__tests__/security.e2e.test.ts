@@ -295,7 +295,7 @@ describe('String max-length validation', () => {
 
     // Should not be a validation error (may still fail due to API, but not Zod)
     expect(result.isError).not.toBe(true);
-  });
+  }, 15000);
 });
 
 // =============================================================================
@@ -338,7 +338,7 @@ describe('Enum restrictions on applikation and gericht', () => {
     });
 
     expect(result.isError).not.toBe(true);
-  });
+  }, 15000);
 
   it('should reject invalid gerichtsbarkeit on ris_judikatur', async () => {
     // The court-system enum is now the `gerichtsbarkeit` parameter (was `gericht`).
