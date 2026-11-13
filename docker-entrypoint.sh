@@ -1,10 +1,24 @@
 #!/bin/sh
+# Container entrypoint: installs custom CA certificates, then runs the CMD as
+# the unprivileged `node` user.
+#
+# Mount a directory with *.crt / *.pem files at /opt/custom-certificates to have
+# them added to the system trust store (and to Node via NODE_EXTRA_CA_CERTS).
+#
+# CERT_DIR / CA_BUNDLE_DIR can be overridden through the environment; this is
+# only meant for testing.
 set -e
 
-CERT_DIR="/opt/custom-certificates"
-CA_BUNDLE_DIR="/usr/local/share/ca-certificates"
+CERT_DIR="${CERT_DIR:-/opt/custom-certificates}"
+CA_BUNDLE_DIR="${CA_BUNDLE_DIR:-/usr/local/share/ca-certificates}"
 
-# Install any custom CA certificates found in the mounted folder
+# Already unprivileged (e.g. `docker run --user`, runAsNonRoot): the trust store
+# cannot be modified, so skip injection instead of failing the container.
+if [ "$(id -u)" != "0" ]; then
+  echo "[entrypoint] Not running as root - skipping custom CA injection."
+  exec "$@"
+fi
+
 if [ -d "$CERT_DIR" ]; then
   CERT_COUNT=0
 
@@ -13,8 +27,11 @@ if [ -d "$CERT_DIR" ]; then
     [ -f "$cert" ] || continue
 
     CERT_NAME="$(basename "$cert")"
+    # update-ca-certificates only processes files ending in .crt, so *.pem files
+    # are installed under a .crt name.
+    TARGET_NAME="${CERT_NAME%.*}.crt"
     echo "[entrypoint] Installing custom CA certificate: $CERT_NAME"
-    cp "$cert" "$CA_BUNDLE_DIR/$CERT_NAME"
+    cp "$cert" "$CA_BUNDLE_DIR/$TARGET_NAME"
     CERT_COUNT=$((CERT_COUNT + 1))
   done
 
@@ -29,7 +46,8 @@ if [ -d "$CERT_DIR" ]; then
     echo "[entrypoint] No custom CA certificates found in $CERT_DIR (expected *.crt or *.pem files)."
   fi
 else
-  echo "[entrypoint] Custom certificate directory $CERT_DIR not mounted — skipping CA injection."
+  echo "[entrypoint] Custom certificate directory $CERT_DIR not mounted - skipping CA injection."
 fi
 
-exec "$@"
+# Drop privileges: the application must not run as root.
+exec su-exec node "$@"
