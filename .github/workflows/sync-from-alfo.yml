@@ -1,0 +1,220 @@
+name: Sync alfo-dev release
+
+# Merges the latest *release* of alfo-dev/ris-mcp-ts into this fork, re-applies
+# the fork change (custom CA certificate support) via
+# .github/fork-yinda/apply-ca-update.sh, verifies the result (checks, build,
+# Docker image smoke test) and opens a PR. Nothing lands on main without a
+# (merge-commit) merge of that PR.
+
+on:
+  schedule:
+    - cron: "43 5 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "alfo-dev tag to sync (empty = latest release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-from-alfo
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: alfo-dev/ris-mcp-ts
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      # SYNC_TOKEN: PAT of the yinda-dev account (classic: repo + workflow;
+      # fine-grained: contents, pull-requests, workflows = write). GITHUB_TOKEN
+      # cannot push changes to .github/workflows/* and PRs/tags it creates do
+      # not trigger other workflows.
+      - name: Require SYNC_TOKEN
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          [ -n "$SYNC_TOKEN" ] || { echo "::error::Repository secret SYNC_TOKEN is not set"; exit 1; }
+
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Resolve alfo-dev release
+        id: up
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name 2>/dev/null || true)
+          fi
+          if [ -z "$TAG" ]; then
+            # No published release (e.g. alfo-dev's release job failed): fall
+            # back to the newest v* tag rather than doing nothing.
+            TAG=$(git ls-remote --tags --refs --sort=-v:refname "https://github.com/$UPSTREAM.git" 'v*' | head -1 | sed 's#.*refs/tags/##')
+            [ -n "$TAG" ] && echo "::warning::No published release found in $UPSTREAM; using newest tag $TAG"
+          fi
+          [ -n "$TAG" ] || { echo "::error::No release or v* tag found in $UPSTREAM"; exit 1; }
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "::error::Unexpected tag '$TAG'"; exit 1; }
+          # Private ref namespace: alfo-dev's tags must not leak into this
+          # fork's tag list (our own v* tags trigger release workflows).
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/$TAG:refs/upstream/$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "branch=sync/alfo-$TAG" >> "$GITHUB_OUTPUT"
+          echo "Syncing alfo-dev release: $TAG"
+
+      - name: Decide whether a sync is needed
+        id: need
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          TAG: ${{ steps.up.outputs.tag }}
+          BRANCH: ${{ steps.up.outputs.branch }}
+        run: |
+          set -euo pipefail
+          reason=""
+          if git merge-base --is-ancestor "refs/upstream/$TAG" HEAD; then
+            reason="main already contains alfo-dev $TAG"
+          elif [ -n "$(gh pr list --head "$BRANCH" --state open   --json number --jq '.[].number')$(gh pr list --head "$BRANCH" --state merged --json number --jq '.[].number')" ]; then
+            # Open or merged (incl. squash-merged, which the ancestry check
+            # can't see). PRs closed without merging may be retried.
+            reason="a sync PR for $TAG is open or already merged"
+          fi
+          if [ -n "$reason" ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing to do: $reason"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup pnpm
+        if: steps.need.outputs.needed == 'true'
+        uses: pnpm/action-setup@v5
+
+      - name: Setup Node.js
+        if: steps.need.outputs.needed == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Merge alfo-dev and re-apply fork change
+        if: steps.need.outputs.needed == 'true'
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+          BRANCH: ${{ steps.up.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+
+          # Real merge (not a copy) so alfo-dev's history stays an ancestor and
+          # the next sync is a small, clean merge.
+          git merge --no-commit --no-ff "refs/upstream/$TAG" || true
+
+          # Files alfo-dev owns AND this fork patches/removes: always take
+          # alfo-dev's version, then re-patch. Deterministic and never leaves
+          # conflict markers in them. Fork-only edits to these files belong in
+          # .github/fork-yinda/apply-ca-update.sh. The two sync workflows and
+          # .github/fork/ are alfo-dev's own sync pipeline, removed by the script.
+          for f in Dockerfile \
+                   .github/workflows/sync-upstream.yml \
+                   .github/workflows/tag-synced-release.yml \
+                   .github/fork/apply-fork-changes.sh; do
+            git checkout "refs/upstream/$TAG" -- "$f" 2>/dev/null || git rm -q -f --ignore-unmatch "$f"
+          done
+
+          bash .github/fork-yinda/apply-ca-update.sh
+          git add -A
+
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "::error::Unresolved merge conflicts outside the managed files:"
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+
+      - name: Install, check, build
+        id: verify
+        if: steps.need.outputs.needed == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm run check
+          pnpm run build
+
+      - name: Build image and smoke-test custom CA support
+        id: image
+        if: steps.need.outputs.needed == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          docker build -t ris-mcp:sync .
+          bash .github/fork-yinda/smoke-test-image.sh ris-mcp:sync
+
+      - name: Commit and push branch
+        if: steps.need.outputs.needed == 'true'
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+          BRANCH: ${{ steps.up.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git add -A
+          git commit -m "chore: sync alfo-dev $TAG"
+          git push origin "HEAD:refs/heads/$BRANCH"
+
+      - name: Open pull request
+        if: steps.need.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          TAG: ${{ steps.up.outputs.tag }}
+          BRANCH: ${{ steps.up.outputs.branch }}
+          VERIFY: ${{ steps.verify.outcome }}
+          IMAGE: ${{ steps.image.outcome }}
+        run: |
+          set -euo pipefail
+          draft=()
+          mark() { [ "$1" = "success" ] && echo "✅" || echo "❌"; }
+          if [ "$VERIFY" != "success" ] || [ "$IMAGE" != "success" ]; then
+            draft=(--draft)
+          fi
+          cat > body.md <<BODY
+          Syncs alfo-dev release [\`$TAG\`](https://github.com/$UPSTREAM/releases/tag/$TAG).
+
+          - $(mark "$VERIFY") \`pnpm run check\` and \`pnpm run build\`
+          - $(mark "$IMAGE") Docker build + custom-CA smoke test (non-root, \`.crt\` and \`.pem\` installed)
+
+          Failed checks are in the workflow run; the PR is opened as draft in that case.
+
+          Fork change re-applied by \`.github/fork-yinda/apply-ca-update.sh\`:
+          - Custom CA certificates from \`/opt/custom-certificates\` via \`docker-entrypoint.sh\`
+          - alfo-dev's own sync workflows removed (they would sync from Honeyfield-Org)
+
+          **Merge with a merge commit** (not squash/rebase) to keep alfo-dev's history intact.
+          Merging tags \`$TAG\` automatically (tag-synced-from-alfo.yml).
+          BODY
+          gh pr create --base main --head "$BRANCH" "${draft[@]}" \
+            --title "chore: sync alfo-dev $TAG" --body-file body.md
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          gh issue create \
+            --title "alfo-dev sync ${TAG:-?} failed" \
+            --body "The sync workflow failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || true
