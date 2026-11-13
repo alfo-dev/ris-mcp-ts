@@ -266,16 +266,49 @@ Found a bug or have a feature request? Please [open an issue](../../issues) usin
 
 ## Releasing (Maintainers)
 
-Releases are automated via GitHub Actions with [OIDC trusted publishing](https://docs.npmjs.com/trusted-publishers/) — no npm tokens required.
+Releases are automated via GitHub Actions with [OIDC trusted publishing](https://docs.npmjs.com/trusted-publishers/) — no npm tokens required. Direct pushes to `main` are blocked, so the version bump goes through a pull request like any other change, and the tag is set on the merged commit:
+
+1. On a branch, bump `version` in `package.json` and both `version` fields in `server.json` (`.version` and `.packages[0].version`) to the new number. Do not use `pnpm version` — it would also create a local tag on the unmerged commit.
+2. Commit as `chore(release): x.y.z (#<PRs since the last release>)`, open a PR, wait for CI, merge.
+3. Tag the merged commit on `main` and push the tag:
+
+   ```bash
+   git fetch origin main
+   git tag vx.y.z origin/main
+   git push origin vx.y.z
+   ```
+
+The tag triggers the release workflow: `pnpm run check` and build, a GitHub Release with notes grouped by commit type, npm publish with provenance, the MCP Registry publish (below), the Docker image to ECR and the gateway deploy — which fails the run if the live `initialize` version does not match the tag. Roll back a deploy by running the "Deploy Gateway" workflow by hand with an existing image tag.
+
+### MCP Registry
+
+The `publish-registry` job in `release.yml` runs after `publish-npm` on every
+`v*` tag: it writes the tag version into `server.json`, installs
+`mcp-publisher`, runs `mcp-publisher login github-oidc` (`id-token: write`, no
+secret) and publishes — with a short retry, because the registry validates the
+package against npm, which can lag right behind a fresh publish. The
+[MCP Registry](https://registry.modelcontextprotocol.io) entry is
+`io.github.Honeyfield-Org/ris`, described by `server.json`. Nothing here is a
+manual step per release; the version comes from the tag, so a forgotten
+`server.json` bump is harmless.
+
+What still has to match by hand: `name` in `server.json` must equal `mcpName`
+in `package.json`, in that **exact spelling** — the registry grants the OIDC
+namespace as GitHub spells the `repository_owner` claim
+(`io.github.Honeyfield-Org/*`) and matches it with a case-sensitive prefix
+check, so any other casing fails to publish.
+
+The registry previously listed this server as `io.github.philrox/ris`
+(personal namespace, last published by hand for 1.0.2 on 2026-02-09 — OIDC
+from a workflow run only grants `io.github.<repository owner>/*`, so CI could
+never have published that name). Server names are immutable, so that entry
+isn't migrated — it stays and is deprecated once, by hand, from the `philrox`
+account, after the first successful automated publish of the new name:
 
 ```bash
-pnpm version patch   # or minor / major
-git push && git push --tags
+mcp-publisher login github   # device flow, as philrox
+mcp-publisher status --status deprecated --all-versions --message "Moved to io.github.Honeyfield-Org/ris" io.github.philrox/ris
 ```
-
-This will:
-1. Bump the version in `package.json` and create a git tag (e.g., `v1.0.1`)
-2. Trigger the release workflow which runs all checks, builds, creates a GitHub Release, and publishes to npm with provenance attestations
 
 ## Questions?
 

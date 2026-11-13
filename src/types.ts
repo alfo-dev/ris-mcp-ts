@@ -125,10 +125,18 @@ export type DokumenteProSeite = z.infer<typeof DokumenteProSeiteSchema>;
  * Only 10/20/50/100 map cleanly to the RIS API's DokumenteProSeite enum;
  * any other value would be silently coerced to 20, so the schema rejects it
  * up front instead.
+ *
+ * The description is the model's only cost signal: `limit` is chosen by the
+ * model, not the user, and without it a broad search reached for 100 and lost
+ * the whole answer to the client's result limit (#106). It lives here rather
+ * than on the eleven tools so it cannot drift between them.
  */
 export const LimitSchema = z
   .union([z.literal(10), z.literal(20), z.literal(50), z.literal(100)])
-  .default(20);
+  .default(20)
+  .describe(
+    'Results per page: 10, 20, 50 or 100 (default: 20). Every hit costs about 1k characters of structured payload, so prefer 20 for browsing and 50 for a broad survey; a page that would exceed the payload budget is delivered at the next smaller page size and says so (page_size, query.limit and notice).',
+  );
 export type Limit = z.infer<typeof LimitSchema>;
 
 /**
@@ -212,6 +220,22 @@ export const DocumentSchema = z.object({
 export type Document = z.infer<typeof DocumentSchema>;
 
 /**
+ * One document as it travels in a search tool's `structuredContent`.
+ *
+ * A projection of {@link DocumentSchema} without its redundancies: `kurztitel`
+ * always equals `titel` (the parser derives both from the same field),
+ * `citation.kurztitel` repeats it once more, and the xml/rtf renditions are the
+ * html URL with another extension — together 35 % of a Judikatur page. A
+ * decision loses nothing: its case number stays in `geschaeftszahl`. The text
+ * block keeps the full shape (#106).
+ */
+export const StructuredDocumentSchema = DocumentSchema.omit({ kurztitel: true }).extend({
+  citation: CitationSchema.omit({ kurztitel: true }),
+  content_urls: ContentUrlSchema.pick({ html: true, pdf: true }),
+});
+export type StructuredDocument = z.infer<typeof StructuredDocumentSchema>;
+
+/**
  * Paginated search results from the RIS API.
  */
 export const SearchResultSchema = z.object({
@@ -223,6 +247,15 @@ export const SearchResultSchema = z.object({
 });
 export type SearchResult = z.infer<typeof SearchResultSchema>;
 
+/** CC BY 4.0 attribution every successful result carries (see attribution.ts). */
+export const AttributionSchema = z
+  .object({
+    text: z.string(),
+    license: z.string(),
+    source_url: z.string(),
+  })
+  .describe('Quellenangabe nach CC BY 4.0');
+
 /**
  * Shape declared as `outputSchema` by every search tool, describing the
  * `structuredContent` they return.
@@ -233,11 +266,18 @@ export type SearchResult = z.infer<typeof SearchResultSchema>;
  * violation that fails the whole tool call.
  */
 export const SearchResultOutputShape = {
+  attribution: AttributionSchema.optional(),
   total_hits: z.number().describe('Total number of documents in RIS matching the search'),
   page: z.number().describe('Page number of this result set (1-based)'),
   page_size: z.number().describe('Number of documents per page'),
   has_more: z.boolean().describe('Whether further result pages are available'),
-  documents: z.array(DocumentSchema).describe('The documents on this page'),
+  notice: z
+    .string()
+    .optional()
+    .describe(
+      'Present when the page was delivered at a smaller size than requested to fit the payload budget — page, page_size and query already describe the delivered page; page with query.limit',
+    ),
+  documents: z.array(StructuredDocumentSchema).describe('The documents on this page'),
   query: z
     .object({
       tool: z
@@ -271,6 +311,7 @@ export const OutlineEntryShape = {
  * would lose by rendering only `structuredContent` is inside `structuredContent`.
  */
 export const DocumentChunkOutputShape = {
+  attribution: AttributionSchema.optional(),
   /**
    * Absent for a document the caller addressed by URL: it has no Dokumentnummer
    * to echo, and inventing one — the URL, or the "Unbekannt" placeholder the
@@ -318,6 +359,7 @@ export const DocumentChunkOutputShape = {
  * document — `ris_dokument_abschnitt` starts the canonical series at 0.
  */
 export const DocumentOutputShape = {
+  attribution: AttributionSchema.optional(),
   /** Absent for a URL-addressed document, exactly as in the chunk shape above. */
   dokumentnummer: z
     .string()

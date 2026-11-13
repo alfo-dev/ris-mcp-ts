@@ -29,8 +29,8 @@ generated sources are never stale; you rarely call it by hand.
 ## Testing
 
 ```bash
-pnpm test                # Server unit tests (1082 tests, 22 files) — node env
-pnpm run test:ui         # Widget tests under ui/ (435 tests, 10 files) — jsdom env
+pnpm test                # Server unit tests (1121 tests, 23 files) — node env
+pnpm run test:ui         # Widget tests under ui/ (436 tests, 10 files) — jsdom env
 pnpm run test:watch      # Run tests in watch mode
 pnpm run test:coverage   # Tests with V8 coverage report
 pnpm run test:integration # Integration tests (separate config, requires network)
@@ -138,6 +138,7 @@ src/
 ├── document-loader.ts # Shared resolve+fetch+scope+format path for the two document tools
 ├── document-cache.ts  # Bounded LRU cache backing the viewer's chunk tool
 ├── helpers.ts         # Shared helper functions for tool handlers
+├── structured-search.ts # Search tools' structuredContent: lean projection + character budget with page-size downgrade (#106)
 ├── constants.ts       # Static mappings, enum values, configuration
 ├── version.ts         # Shared VERSION constant (read from package.json)
 ├── widgets.ts         # MCP Apps: widget resource + the tools' _meta.ui
@@ -175,6 +176,7 @@ src/
     ├── security.e2e.test.ts
     ├── server.test.ts
     ├── structured-content.e2e.test.ts
+    ├── structured-search.test.ts # projection, budget maths, env override
     ├── tool-errors.e2e.test.ts
     ├── types.test.ts
     ├── ui-resource.e2e.test.ts   # widget resource + tool _meta over a real Client
@@ -242,6 +244,18 @@ fail to start in every host. `gen-ui.mjs` refuses a bundle that still carries a
 relative import, and `ui-template.test.ts` asserts the same thing plus the
 presence of the SDK.
 
+**zod ships in English only.** ext-apps validates host messages through `z.…`,
+and a namespace used as a value keeps every member alive — `z.locales` with 49
+translations included, which was ~187 000 of ~360 000 characters per widget
+under zod 4.3 and pushed both past the 400 000 budget under 4.6. The
+`zodEnglishOnly()` plugin in `vite.ui.config.ts` replaces zod's
+`../locales/index.js` barrel with one that exports `en`; zod's own `en` import
+is untouched, and the server, which is not bundled, keeps every locale. Measured:
+~360 000 → ~211 000 characters (zod 4.3.6), ~445 000 → ~280 000 (4.6.6). The
+plugin hangs on a zod-internal path, so `ui-template.test.ts` asserts a Japanese
+locale literal is absent — a zod rename fails that test instead of silently
+re-growing the bundle.
+
 Widget discovery still comes from the sources (`ui/<name>/index.html`), so a new
 widget means a new directory, not a config edit. `src/generated/` is gitignored
 and rebuilt by the `pre*` hooks; a widget that failed to build raises a named
@@ -255,7 +269,7 @@ Each tool lives in `src/tools/<name>.ts` and exports a `register<Name>Tool(serve
 
 1. The 11 search tools and `ris_dokument` register with `registerAppTool(server, name, { title, description, inputSchema, outputSchema, annotations, _meta }, handler)` from `@modelcontextprotocol/ext-apps/server` — same config object as `server.registerTool()` plus a `_meta` from `src/widgets.ts` that points the tool at its widget: `SEARCH_WIDGET_META` → Trefferliste, `VIEWER_WIDGET_META` → document viewer. `ris_dokument` declares `DocumentOutputShape` rather than the search shape (see below); the wrapper only touches the descriptor. `ris_dokument_abschnitt` uses plain `server.registerTool()` because it sets no `resourceUri` — it feeds the viewer that is already open. The deprecated `server.tool(...)` overload is no longer used.
 2. `title` is a German display name, `description`/`inputSchema` are English. `annotations` is `{ readOnlyHint: true, openWorldHint: true, destructiveHint: false }` on **all 13** tools — `destructiveHint` is spec-redundant once `readOnlyHint` is true, but OpenAI lists it as a required annotation for app submissions; do not drop it as noise.
-3. Search tools declare `SearchResultOutputShape` (types.ts) as `outputSchema`; successful results carry the parsed result plus the `query` echo as `structuredContent` (emitted centrally in `executeSearchTool()`), error results (`isError: true`) carry none. `executeSearchTool()` takes the echo from `buildQueryEcho(toolName, args)` as a required argument, so a new search tool cannot silently ship without pagination support.
+3. Search tools declare `SearchResultOutputShape` (types.ts) as `outputSchema`; successful results carry the parsed result — projected to `StructuredDocumentSchema` and fitted into the structured-content budget by `fitStructuredSearchPage()` (structured-search.ts) — plus the `query` echo as `structuredContent` (emitted centrally in `executeSearchTool()`), error results (`isError: true`) carry none. `executeSearchTool()` takes the echo from `buildQueryEcho(toolName, args)` as a required argument, so a new search tool cannot silently ship without pagination support.
 4. For `limit`/`seite`, reuse `LimitSchema`/`SeiteSchema` from `types.ts` instead of raw `z.number()`
 5. Use `helpers.ts` functions: `hasAnyParam()`, `buildBaseParams()`, `addOptionalParams()`, `executeSearchTool()`
 6. Call client search functions from `client.ts`
@@ -283,6 +297,7 @@ Each tool lives in `src/tools/<name>.ts` and exports a `register<Name>Tool(serve
 
 - **Timeout**: 30,000ms (30 seconds)
 - **Character limit**: 25,000 characters (formatting.ts `CHARACTER_LIMIT`, exported — it is also the chunk size of `ris_dokument_abschnitt`)
+- **Structured-content budget**: 45,000 characters of serialized `structuredContent` per search page (structured-search.ts `DEFAULT_STRUCTURED_CONTENT_BUDGET`, env `RIS_STRUCTURED_CONTENT_BUDGET`); a page over it is delivered at the next smaller RIS page size whose offset stays exact, never by cutting `documents[]`
 - **Document cache**: 10 entries / 1,000,000 characters / 10 min TTL per `registerAllTools()` call (document-cache.ts)
 - **Pagination**: 10/20/50/100 documents per page (mapped via `limitToDokumenteProSeite()` in types.ts)
 - **Allowed document hosts**: `data.bka.gv.at`, `www.ris.bka.gv.at`, `ris.bka.gv.at` (SSRF protection in client.ts)
@@ -588,14 +603,14 @@ editable**: a new tunnel URL means deleting the connector and adding it again.
 
 GitHub Actions runs on push/PR to main:
 - **CI**: Matrix test (Node 20, 22) → `pnpm run check` + coverage
-- **Release**: Tag push (`v*`) → check + build + GitHub Release + npm publish (Trusted Publishing/OIDC, no NPM_TOKEN)
+- **Release**: Tag push (`v*`) → check + build + GitHub Release + npm publish (Trusted Publishing/OIDC, no NPM_TOKEN) + MCP Registry publish (GitHub OIDC, `io.github.Honeyfield-Org/ris`)
 - **CodeQL**: Weekly security scanning
 
 ### Release Flow
 
 ```
 feature branch → PR → merge to main → git tag v1.x.x → push tag
-  → GitHub Release + npm publish (OIDC) + Docker build → ECR → gateway deploy
+  → GitHub Release + npm publish (OIDC) + MCP Registry publish (OIDC) + Docker build → ECR → gateway deploy
 ```
 
 Direct pushes to main are blocked — version-bump commits go through a PR as well.
@@ -645,14 +660,42 @@ those 11 declare
 [MCP Apps](#mcp-apps-trefferliste-and-viewer-widgets)).
 
 Their `structuredContent` holds the pagination fields (`total_hits`, `page`,
-`page_size`, `has_more`), the `documents` array and a `query` echo — the tool's
+`page_size`, `has_more`), the `documents` array, a `query` echo — the tool's
 own name plus the validated arguments, so a client (or the widget) can page by
-re-issuing the call with an incremented `seite`. Each document carries
+re-issuing the call with an incremented `seite` — and, on a downgraded page, a
+German `notice`. Documents travel in the lean `StructuredDocumentSchema`
+shape (#106): no `kurztitel` (it always equals `titel`), no
+`citation.kurztitel`, only the `html` and `pdf` renditions. Each carries
 `citation_display`, the preformatted citation line as it appears in the text
 output, and Judikatur hits additionally carry `gericht`, `geschaeftszahl`,
-`entscheidungsdatum` and `rechtssatznummer`. All of these live in
-`structuredContent` only — the markdown text is unchanged by them, and
-`structuredContent` is not subject to the 25,000-character text limit.
+`entscheidungsdatum` and `rechtssatznummer` — present even when null, because
+the widget tells a decision from a law by their presence. The markdown text
+keeps the parser's full shape and is unchanged by any of this.
+
+**The structured payload has a character budget, the text block has its own.**
+`fitStructuredSearchPage()` (structured-search.ts) serializes the payload and,
+over `DEFAULT_STRUCTURED_CONTENT_BUDGET` (45,000; env
+`RIS_STRUCTURED_CONTENT_BUDGET`), delivers the page at the largest smaller RIS
+page size whose offset arithmetic stays exact — `(seite − 1) · limit` must be a
+multiple of the new size, so page 1 accepts any and deeper pages fall back to a
+divisor — rewriting `page`, `page_size`, `has_more`, `documents` and
+`query.limit`/`query.seite`, and appending the notice to the text after
+truncation. It runs *before* formatting so both channels describe the same
+page. It is deliberately not a cut of `documents[]`: the widget re-issues with
+`query.limit` and RIS pages with `DokumenteProSeite`, so a cut page would make
+the next one skip hits. Why the budget sits on the structured payload: Claude
+Code measures exactly `JSON.stringify(structuredContent)` against
+`MAX_MCP_OUTPUT_TOKENS` (25,000 tokens), replaces the whole result with a file
+pointer when over, and shows the model the structured JSON instead of the text
+block whenever a tool returns both — measured live 2026-09-04 with a rejected
+117,770-character `ris_judikatur limit: 50` page, and on 2026-09-08 with the
+60,000 default still in place: 58,659 and 59,362 characters rejected, 46,311
+and 41,515 accepted, which is why the default is 45,000 (#106). claude.ai has
+no observed size limit — its widget rendered 138,050 characters completely
+and the model there reads the text block, not the structured payload
+(reporter measurement 2026-09-04). `LimitSchema`'s description is the model's
+cost signal for `limit`.
+
 Both document tools declare an `outputSchema` whose payload *carries the
 document text itself*. That is what makes it safe: clients may treat the text
 block as a mere serialization of `structuredContent` and render only the latter,

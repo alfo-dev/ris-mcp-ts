@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20.19.0-brightgreen.svg)](https://nodejs.org/)
 [![MCP](https://img.shields.io/badge/MCP-compatible-blue.svg)](https://modelcontextprotocol.io/)
-[![MCP Registry](https://img.shields.io/badge/MCP_Registry-io.github.philrox%2Fris-green.svg)](https://registry.modelcontextprotocol.io)
+[![MCP Registry](https://img.shields.io/badge/MCP_Registry-io.github.Honeyfield--Org%2Fris-green.svg)](https://registry.modelcontextprotocol.io)
 
 An [MCP (Model Context Protocol)](https://modelcontextprotocol.io/) server that gives AI assistants access to Austria's official legal database — the **Rechtsinformationssystem (RIS)**.
 
@@ -31,7 +31,7 @@ The server translates these natural language requests into structured API calls 
 
 ## Features
 
-- **12 specialized tools** covering all major RIS collections
+- **13 specialized tools** covering all major RIS collections
 - **Federal law** (ABGB, StGB, UGB, ...) and **state law** for all 9 provinces
 - **Court decisions** from 16 court types (Supreme Court, Constitutional Court, Administrative Court, ...)
 - **Law gazettes** — Federal (BGBl) and state (LGBl)
@@ -154,6 +154,7 @@ npx -y ris-mcp-ts
 | `ris_landesgesetzblatt` | Search State Law Gazettes (LGBl) |
 | `ris_regierungsvorlagen` | Search government bills |
 | `ris_dokument` | Retrieve full document text by ID or URL |
+| `ris_dokument_abschnitt` | Return one section of an open document by character offset (feeds the document viewer widget) |
 | `ris_bezirke` | Search district authority announcements |
 | `ris_gemeinden` | Search municipal law and regulations |
 | `ris_sonstige` | Search miscellaneous collections (8 sub-apps) |
@@ -225,7 +226,7 @@ Search Austrian federal laws such as ABGB, StGB, UGB, and more.
 | `applikation` | string | "BrKons" (consolidated, default), "Begut" (drafts), "BgblAuth" (gazette), "Erv" (English translations) |
 | `fassung_vom` | string | Date for historical version (YYYY-MM-DD) |
 | `seite` | number | Page number (default: 1) |
-| `limit` | number | Results per page: 10, 20, 50, 100 (default: 20) |
+| `limit` | number | Results per page: 10, 20, 50, 100 (default: 20). Prefer 20; a page over the structured-payload budget is delivered at the next smaller size (see [Result size](#result-size)) |
 | `response_format` | string | "markdown" (default) or "json" |
 
 All parameters are optional. At least one search parameter (`suchworte`, `titel`, or `paragraph`) should be provided.
@@ -252,7 +253,7 @@ Search state laws of the nine Austrian provinces.
 | `gesetzesnummer` | string | Exact law number (Gesetzesnummer) of a specific state law |
 | `applikation` | string | "LrKons" (consolidated, default) |
 | `seite` | number | Page number |
-| `limit` | number | Results per page |
+| `limit` | number | Results per page: 10, 20, 50, 100 (default: 20). Prefer 20; a page over the structured-payload budget is delivered at the next smaller size (see [Result size](#result-size)) |
 | `response_format` | string | "markdown" or "json" |
 
 </details>
@@ -280,7 +281,7 @@ Search court decisions from Austrian courts.
 | `entscheidungsdatum_bis` | string | Decision date to (YYYY-MM-DD) |
 | `sortierung` | string | Sort by decision date: "datum_auf" (oldest first) or "datum_ab" (newest first) |
 | `seite` | number | Page number |
-| `limit` | number | Results per page |
+| `limit` | number | Results per page: 10, 20, 50, 100 (default: 20). Prefer 20; a page over the structured-payload budget is delivered at the next smaller size (see [Result size](#result-size)) |
 | `response_format` | string | "markdown" or "json" |
 
 **Available `gerichtsbarkeit` values (16):**
@@ -322,7 +323,7 @@ Search the Federal Law Gazette (BGBl) — official publications of federal legis
 | `titel` | string | Search in titles |
 | `applikation` | string | "BgblAuth" (authentic from 2004, default), "BgblPdf" (PDF), "BgblAlt" (1945–2003) |
 | `seite` | number | Page number |
-| `limit` | number | Results per page |
+| `limit` | number | Results per page: 10, 20, 50, 100 (default: 20). Prefer 20; a page over the structured-payload budget is delivered at the next smaller size (see [Result size](#result-size)) |
 | `response_format` | string | "markdown" or "json" |
 
 </details>
@@ -343,7 +344,7 @@ Search State Law Gazettes (LGBl) — official publications of state legislation.
 | `titel` | string | Search in titles |
 | `applikation` | string | "LgblAuth" (authentic, default), "Lgbl" (general), "LgblNO" (Niederoesterreich) |
 | `seite` | number | Page number |
-| `limit` | number | Results per page |
+| `limit` | number | Results per page: 10, 20, 50, 100 (default: 20). Prefer 20; a page over the structured-payload budget is delivered at the next smaller size (see [Result size](#result-size)) |
 | `response_format` | string | "markdown" or "json" |
 
 </details>
@@ -366,7 +367,7 @@ Search government bills — draft legislation submitted to parliament.
 | `sortierung_richtung` | string | Ascending or Descending |
 | `sortierung_spalte` | string | Kurztitel, EinbringendeStelle, Beschlussdatum |
 | `seite` | number | Page number |
-| `limit` | number | Results per page |
+| `limit` | number | Results per page: 10, 20, 50, 100 (default: 20). Prefer 20; a page over the structured-payload budget is delivered at the next smaller size (see [Result size](#result-size)) |
 | `response_format` | string | "markdown" or "json" |
 
 </details>
@@ -409,6 +410,36 @@ At least one of `dokumentnummer` or `url` is required. Long documents are trunca
 </details>
 
 <details>
+<summary><strong>ris_dokument_abschnitt</strong> — Document Section</summary>
+
+Return one section of a document already open in the RIS document viewer. Intended for the viewer widget, not for direct use — for the full text of a document use `ris_dokument`.
+
+The tool is declared app-only (`_meta.ui.visibility: ["app"]`): hosts that honour the flag hide it from the model and let only the viewer widget call it. It serves the same text `ris_dokument` produced, from the document cache where possible, so the offsets the viewer holds address the same document.
+
+**Inputs:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `dokumentnummer` | string | RIS document number of the open document - from the ris_dokument call that opened it |
+| `url` | string | Direct URL of the open document, for documents opened by URL rather than by number |
+| `offset` | number | Character offset into the document text; 0 returns the first section and the outline (default: 0) |
+
+At least one of `dokumentnummer` or `url` is required. Each section is 25,000 characters long.
+
+**Output (`structuredContent`):**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `text` | string | The requested section of the document text |
+| `total_length` | number | Length of the complete document text — compare across calls to detect that the document was re-fetched and offsets shifted |
+| `next_offset` | number \| null | Offset to request for the following section, or null at the end of the document |
+| `outline` | array | Jump targets of the document. Only returned for offset 0; empty when the document has no headings |
+| `dokumentnummer` | string | RIS document number of the document this section belongs to (absent for documents opened by URL) |
+| `source_url` | string | RIS URL the document text was rendered from |
+
+</details>
+
+<details>
 <summary><strong>ris_bezirke</strong> — District Authority Announcements</summary>
 
 Search announcements from district administrative authorities.
@@ -428,7 +459,7 @@ Search announcements from district administrative authorities.
 | `kundmachungsdatum_bis` | string | Date to (YYYY-MM-DD) |
 | `im_ris_seit` | string | Added recently: EinerWoche, ZweiWochen, EinemMonat, DreiMonaten, SechsMonaten, EinemJahr |
 | `seite` | number | Page number |
-| `limit` | number | Results per page |
+| `limit` | number | Results per page: 10, 20, 50, 100 (default: 20). Prefer 20; a page over the structured-payload budget is delivered at the next smaller size (see [Result size](#result-size)) |
 | `response_format` | string | "markdown" or "json" |
 
 </details>
@@ -449,7 +480,7 @@ Search municipal law — local ordinances and regulations.
 | `applikation` | string | "Gr" (municipal law, default) or "GrA" (official gazettes) |
 | `im_ris_seit` | string | Added recently |
 | `seite` | number | Page number |
-| `limit` | number | Results per page |
+| `limit` | number | Results per page: 10, 20, 50, 100 (default: 20). Prefer 20; a page over the structured-payload budget is delivered at the next smaller size (see [Result size](#result-size)) |
 | `response_format` | string | "markdown" or "json" |
 
 Additional parameters depend on the selected application. See `Gr` (municipal law) and `GrA` (official gazettes) specific parameters in the source code.
@@ -472,7 +503,7 @@ Search miscellaneous legal collections and specialized databases.
 | `datum_bis` | string | Date to (YYYY-MM-DD) |
 | `im_ris_seit` | string | Added recently |
 | `seite` | number | Page number |
-| `limit` | number | Results per page |
+| `limit` | number | Results per page: 10, 20, 50, 100 (default: 20). Prefer 20; a page over the structured-payload budget is delivered at the next smaller size (see [Result size](#result-size)) |
 | `response_format` | string | "markdown" or "json" |
 
 **Available collections:**
@@ -506,7 +537,7 @@ Track document creation, modification, and deletion across the RIS database.
 | `aenderungen_bis` | string | Changes to date (YYYY-MM-DD) |
 | `include_deleted` | boolean | Include deleted documents (default: false) |
 | `seite` | number | Page number |
-| `limit` | number | Results per page |
+| `limit` | number | Results per page: 10, 20, 50, 100 (default: 20). Prefer 20; a page over the structured-payload budget is delivered at the next smaller size (see [Result size](#result-size)) |
 | `response_format` | string | "markdown" or "json" |
 
 **Available applications (36):**
@@ -537,10 +568,49 @@ Search state ordinance gazettes (Verordnungsblätter).
 | `kundmachungsdatum_von` | string | Date from (YYYY-MM-DD) |
 | `kundmachungsdatum_bis` | string | Date to (YYYY-MM-DD) |
 | `seite` | number | Page number |
-| `limit` | number | Results per page |
+| `limit` | number | Results per page: 10, 20, 50, 100 (default: 20). Prefer 20; a page over the structured-payload budget is delivered at the next smaller size (see [Result size](#result-size)) |
 | `response_format` | string | "markdown" or "json" |
 
 </details>
+
+### Result size
+
+The text block of every tool is capped at 25,000 characters. The search tools'
+`structuredContent` has its own budget of 45,000 characters (serialized); a
+page that would exceed it is delivered at the next smaller RIS page size
+(100 → 50 → 20 → 10) with `page`, `page_size`, `has_more` and the `query` echo
+rewritten to that size and a German `notice` in both the text and the payload.
+Page with `query.limit` and `query.seite` as echoed. Prefer `limit: 20`; 50
+suits a broad survey; 100 is only ever delivered when the hits are small.
+The default is calibrated to Claude Code, which rejects a result whose
+structured payload exceeds 25,000 tokens (measured: rejected at 58,659
+characters, accepted at 46,311; the margin below that covers content that
+tokenizes worse); claude.ai renders far larger payloads and needs no budget.
+Self-hosters whose client accepts larger results can raise the budget with the
+`RIS_STRUCTURED_CONTENT_BUDGET` environment variable (a positive integer).
+
+## Use as a Library
+
+Hosts that run their own MCP server (for example a metered gateway) can register the RIS tools without the
+bundled transports:
+
+```ts
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { registerRisTools, RIS_ERROR_META_KEY, UNCOUNTED_TOOLS } from 'ris-mcp-ts/library';
+
+const server = new McpServer({ name: 'my-host', version: '1.0.0' });
+registerRisTools(server, {
+  fetch: (url, init) => fetch(url, init), // every RIS request of a tool call goes through here (cache, rate limit)
+  wrapHandler: (toolName, handler) => async (args, extra) => handler(args, extra), // auth, quota, logging
+  // documentCache: share one cache across per-request servers in stateless hosting
+});
+```
+
+- Every successful result carries the CC BY 4.0 attribution (text block and `structuredContent.attribution`);
+  every tool description says that only the authentic RIS promulgations are legally binding.
+- Failed calls carry their kind in `result._meta[RIS_ERROR_META_KEY]`: `timeout`, `upstream` (RIS 5xx or network),
+  `client` (RIS 4xx), `parsing`, `validation` or `internal` — so a host can, e.g., not bill RIS outages.
+- `UNCOUNTED_TOOLS` lists app-only helpers (`ris_dokument_abschnitt`) a host should not bill again.
 
 ## Development
 
