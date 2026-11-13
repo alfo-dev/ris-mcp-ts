@@ -1,0 +1,201 @@
+name: Sync upstream release
+
+# Merges the latest *release* of Honeyfield-Org/ris-mcp-ts into this fork,
+# re-applies the fork changes (Docker image, Node 24 CI, proxy support, trimmed
+# release workflow) via .github/fork/apply-fork-changes.sh, verifies the result and opens
+# a PR. Nothing lands on main without a (merge-commit) merge of that PR.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to sync (empty = latest release)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: Honeyfield-Org/ris-mcp-ts
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      # SYNC_TOKEN: PAT (classic: repo + workflow; fine-grained: contents,
+      # pull-requests, workflows = write). GITHUB_TOKEN cannot push changes to
+      # .github/workflows/* and PRs it opens do not trigger CI.
+      - name: Require SYNC_TOKEN
+        env:
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          [ -n "$SYNC_TOKEN" ] || { echo "::error::Repository secret SYNC_TOKEN is not set"; exit 1; }
+
+      - name: Checkout main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Resolve upstream release
+        id: up
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-}"
+          if [ -z "$TAG" ]; then
+            TAG=$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)
+          fi
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "::error::Unexpected tag '$TAG'"; exit 1; }
+          # Fetched into a private ref namespace so upstream tags never leak into
+          # this fork's tag list (our own v* tags trigger release workflows).
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/$TAG:refs/upstream/$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "branch=sync/upstream-$TAG" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: $TAG"
+
+      - name: Decide whether a sync is needed
+        id: need
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          TAG: ${{ steps.up.outputs.tag }}
+          BRANCH: ${{ steps.up.outputs.branch }}
+        run: |
+          set -euo pipefail
+          reason=""
+          if git merge-base --is-ancestor "refs/upstream/$TAG" HEAD; then
+            reason="main already contains upstream $TAG"
+          elif [ -n "$(gh pr list --head "$BRANCH" --state all --json number --jq '.[].number')" ]; then
+            # Covers open PRs and squash/rebase-merged ones (ancestry check can't see those).
+            reason="a sync PR for $TAG already exists"
+          fi
+          if [ -n "$reason" ]; then
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+            echo "Nothing to do: $reason"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup pnpm
+        if: steps.need.outputs.needed == 'true'
+        uses: pnpm/action-setup@v5
+
+      - name: Setup Node.js
+        if: steps.need.outputs.needed == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Merge upstream and re-apply fork changes
+        if: steps.need.outputs.needed == 'true'
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+          BRANCH: ${{ steps.up.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+
+          # Real merge (not a copy) so upstream history stays an ancestor and
+          # the next sync is a small, clean merge.
+          git merge --no-commit --no-ff "refs/upstream/$TAG" || true
+
+          # Files that upstream owns AND the fork once patched (client.ts and
+          # security.e2e.test.ts carried PR #4's old inline proxy/timeout edits,
+          # now superseded by src/proxy-fetch.ts and upstream): always take
+          # upstream's version, then re-patch. Deterministic, and never leaves conflict
+          # markers in them. Fork-only edits to these files belong in
+          # .github/fork/apply-fork-changes.sh.
+          for f in .github/workflows/ci.yml .github/workflows/release.yml \
+                   .github/workflows/deploy.yml Dockerfile package.json \
+                   pnpm-lock.yaml src/fetch-context.ts \
+                   src/client.ts src/__tests__/security.e2e.test.ts; do
+            git checkout "refs/upstream/$TAG" -- "$f" 2>/dev/null || git rm -q -f --ignore-unmatch "$f"
+          done
+
+          bash .github/fork/apply-fork-changes.sh
+          git add -A
+
+          if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+            echo "::error::Unresolved merge conflicts outside the managed files:"
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+
+      - name: Install, verify
+        id: verify
+        if: steps.need.outputs.needed == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm run check
+          pnpm run build
+
+      - name: Commit and push branch
+        if: steps.need.outputs.needed == 'true'
+        env:
+          TAG: ${{ steps.up.outputs.tag }}
+          BRANCH: ${{ steps.up.outputs.branch }}
+        run: |
+          set -euo pipefail
+          git add -A
+          git commit -m "chore: sync upstream $TAG"
+          git push origin "HEAD:refs/heads/$BRANCH"
+
+      - name: Open pull request
+        if: steps.need.outputs.needed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          TAG: ${{ steps.up.outputs.tag }}
+          BRANCH: ${{ steps.up.outputs.branch }}
+          VERIFY: ${{ steps.verify.outcome }}
+        run: |
+          set -euo pipefail
+          draft=()
+          status="✅ \`pnpm run check\` and \`pnpm run build\` passed."
+          if [ "$VERIFY" != "success" ]; then
+            draft=(--draft)
+            status="❌ Verification failed in the sync job — see the workflow run. Opened as draft."
+          fi
+          cat > body.md <<BODY
+          Syncs upstream release [\`$TAG\`](https://github.com/$UPSTREAM/releases/tag/$TAG).
+
+          $status
+
+          Fork changes re-applied by \`.github/fork/apply-fork-changes.sh\`:
+          - Node 24 in CI matrix and Dockerfile
+          - \`deploy.yml\` removed; \`release.yml\` keeps only the release job (no npm, MCP registry or deploy jobs)
+          - Proxy support (\`HTTPS_PROXY\`/\`HTTP_PROXY\`) via \`src/proxy-fetch.ts\`
+          - \`undici\` dependency + override, lockfile regenerated
+
+          **Merge with a merge commit** (not squash/rebase) to keep upstream history intact.
+          Merging tags \`$TAG\` automatically (tag-synced-release.yml).
+          BODY
+          gh pr create --base main --head "$BRANCH" "${draft[@]}" \
+            --title "chore: sync upstream $TAG" --body-file body.md
+
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          gh issue create \
+            --title "Upstream sync ${TAG:-?} failed" \
+            --body "The sync workflow failed: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" || true

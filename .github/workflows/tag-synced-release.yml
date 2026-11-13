@@ -1,0 +1,42 @@
+name: Tag synced release
+
+# When a sync PR (branch sync/upstream-vX.Y.Z) is merged, tag the merge commit
+# vX.Y.Z. The tag triggers release.yml and publish-docker-image.yaml.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tag:
+    if: >-
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.head.ref, 'sync/upstream-v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout merge commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      # SYNC_TOKEN (not GITHUB_TOKEN): tags pushed with GITHUB_TOKEN do not
+      # trigger other workflows.
+      - name: Create and push tag
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          TAG="${HEAD_REF#sync/upstream-}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists - skipping"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG (synced from upstream)"
+          git push origin "refs/tags/$TAG"
