@@ -78,7 +78,7 @@ jobs:
           reason=""
           if git merge-base --is-ancestor "refs/upstream/$TAG" HEAD; then
             reason="main already contains upstream $TAG"
-          elif [ -n "$(gh pr list --head "$BRANCH" --state all --json number --jq '.[].number')" ]; then
+          elif [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')$(gh pr list --head "$BRANCH" --state merged --json number --jq '.[].number')" ]; then
             # Covers open PRs and squash/rebase-merged ones (ancestry check can't see those).
             reason="a sync PR for $TAG already exists"
           fi
