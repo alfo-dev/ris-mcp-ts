@@ -7,6 +7,7 @@
 import { RISAPIError, RISParsingError, RISTimeoutError } from './client.js';
 import { formatSearchResults, truncateResponse } from './formatting.js';
 import { parseSearchResults } from './parser.js';
+import { fitStructuredSearchPage } from './structured-search.js';
 import { type NormalizedSearchResults, limitToDokumenteProSeite } from './types.js';
 
 // =============================================================================
@@ -106,15 +107,54 @@ export function createErrorResponse(text: string): McpToolResponse<[TextContent]
 }
 
 /**
+ * `_meta` key carrying the kind of a tool error, so a host can tell an RIS
+ * outage (not the caller's fault — e.g. not counted against a quota) from a
+ * bad request without parsing German prose.
+ */
+export const RIS_ERROR_META_KEY = 'io.github.honeyfield-org/ris-error';
+
+/**
+ * - `timeout`: RIS did not answer in time (after the retry)
+ * - `upstream`: RIS answered 5xx or the request failed on the network
+ * - `client`: RIS answered 4xx
+ * - `parsing`: RIS answered something that is not a valid result
+ * - `validation`: the arguments were rejected before any RIS request
+ * - `internal`: anything else
+ */
+export type RisErrorKind =
+  'timeout' | 'upstream' | 'client' | 'parsing' | 'validation' | 'internal';
+
+export function risErrorKind(error: unknown): RisErrorKind {
+  if (error instanceof RISTimeoutError) return 'timeout';
+  if (error instanceof RISParsingError) return 'parsing';
+  if (error instanceof RISAPIError) {
+    const status = error.statusCode;
+    return status !== undefined && status >= 400 && status < 500 ? 'client' : 'upstream';
+  }
+  return 'internal';
+}
+
+/** Error response for a caught exception: German message plus its {@link RisErrorKind}. */
+export function createRisErrorResponse(error: unknown): McpToolResponse<[TextContent]> {
+  return {
+    ...createErrorResponse(formatErrorResponse(error)),
+    _meta: { [RIS_ERROR_META_KEY]: risErrorKind(error) },
+  };
+}
+
+/**
  * Create a validation error response listing required parameters.
  */
 export function createValidationErrorResponse(
   requiredParams: string[],
 ): McpToolResponse<[TextContent]> {
   const paramList = requiredParams.map((p) => `- \`${p}\``).join('\n');
-  return createErrorResponse(
-    '**Fehler:** Bitte gib mindestens einen Suchparameter an:\n' + paramList,
-  );
+  return {
+    ...createErrorResponse(
+      '**Fehler:** Bitte gib mindestens einen Suchparameter an:\n' + paramList,
+    ),
+    _meta: { [RIS_ERROR_META_KEY]: 'validation' satisfies RisErrorKind },
+  };
 }
 
 /**
@@ -189,8 +229,10 @@ export type SearchFunction = (
  * Execute a search tool and return formatted results.
  * Handles the common try-catch, parsing, formatting, and truncation logic.
  *
- * The formatted text stays the primary payload; the parsed result is attached as
- * `structuredContent` so clients can consume the hits without re-parsing prose.
+ * The formatted text stays the complete rendering; the parsed result is
+ * attached as `structuredContent` in the lean shape of `StructuredDocumentSchema`
+ * (see structured-search.ts) so clients can consume the hits without re-parsing
+ * prose.
  * Error results carry no structured payload — there is no result to describe.
  *
  * `signal` is the MCP request's cancellation signal (`extra.signal`). It reaches
@@ -202,6 +244,13 @@ export type SearchFunction = (
  * so a client can page through the results without reconstructing the call. It is
  * required, not optional: a search tool added later could otherwise omit it and
  * silently strand its clients without pagination for that one tool.
+ *
+ * The page is fitted into the structured-content budget *before* it is
+ * formatted (see `fitStructuredSearchPage`), so the text block and the
+ * structured payload always describe the same page; a downgrade notice is
+ * appended to the text after truncation so it can never be cut off, and
+ * travels as `structuredContent.notice` for the clients that show the model
+ * the structured payload instead of the text (#106).
  */
 export async function executeSearchTool(
   searchFn: SearchFunction,
@@ -213,16 +262,17 @@ export async function executeSearchTool(
   try {
     const apiResponse = await searchFn(params, undefined, signal);
     const searchResult = parseSearchResults(apiResponse as NormalizedSearchResults);
-    const formatted = formatSearchResults(searchResult, responseFormat);
-    const result = truncateResponse(formatted);
+    const page = fitStructuredSearchPage(searchResult, queryEcho);
+    const formatted = formatSearchResults(page.result, responseFormat);
+    const text = truncateResponse(formatted);
     return {
-      ...createMcpResponse(result),
-      structuredContent: { ...searchResult, query: queryEcho },
+      ...createMcpResponse(page.notice === null ? text : `${text}\n\n---\n${page.notice}`),
+      structuredContent: page.structured,
     };
   } catch (e) {
     if (signal?.aborted) {
       throw e;
     }
-    return createErrorResponse(formatErrorResponse(e));
+    return createRisErrorResponse(e);
   }
 }
